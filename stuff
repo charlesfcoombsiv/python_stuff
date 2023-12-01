@@ -1,0 +1,574 @@
+def tableone_custom(df, col_to_strat="", cols_to_analyze_list=[],cols_freq_list=[], rowpctn=False, p_values=False, df_ord=None, beautify=True):
+    """
+    tableone_custom
+    tableone creates the “Table 1” summary statistics for a patient population.
+    It was modeled after the R package of the same name by Yoshida and Bohn.
+    
+
+    Parameters:
+            df                  : (dataframe) The dataframe to analyze.
+
+            col_to_strat        : (string) (not required) Categorical variable to stratify analysis by.
+                                    If column is category dtype, there cannot be a category "_Missing_".
+                                    Cannot be boolean dtype because of how columns get named.
+
+            cols_to_analyze_list: (list of strings) Names of the columns to analyze.
+                                    If column is category dtype, there cannot be a category of "_Missing_"
+            
+            cols_freq_list      : (list of strings) Columns to treat as categorical varibles.
+                                    All other variables will be treated as continuous
+                            
+            rowpctn             : (Boolean: True, False) Perform row percent instead of column percent
+
+            p_values            : (Boolean: True, False) Return p values and test statistics for stratified analysis.
+                                    For continuous variables with 2 distinct stratification values, t-test returns t statistics.
+                                    For continuous variables with >2 distinct stratification values, ANOVA returns F-value.
+                                    For categorical variables with >5 values, Chi-Squared returns Chi-square.
+                      
+            df_ord              : (dataframe) Dataframe of variable name, values, and order to be displayed in the results
+                                    See example below for format.
+                                    If the variable is category type, you can set order in the variable itself instead of using df_ord.
+                                    This will override any order from category dtypes.
+                                    If there isn't df_ord, and regardless of category dtype, 'Yes','No' will be 1st and 2nd.
+            
+            beautify            : (Boolean: True, False) Make the table presentation ready by:
+                                    Combine n and percent to n(%) in one column.
+                                    Remove redundant values in "Characteristics".
+                                    Remove "Order" and "Variable type" columns.
+                      
+
+           
+    Returns:
+            final_df            : (dataframe) Summary dataframe of the counts, percents, quartiles, p values, 
+                                    and test statistics for all the columns analyzed.
+
+    Example: 
+        
+        df_order = pd.DataFrame({"Characteristics": ['name','name','name','region','region','region','region','region'],
+                       "Values": ['Susi', 'Sally', 'John', 'North','South','East','West','Arctic'],
+                       "Order new": [0,1,2,0,1,2,3,4]})
+        
+        df_out  = tableone_custom(df=df_pan, col_to_strat="plan", 
+                          cols_to_analyze_list=['name','age', 'region'],
+                          cols_freq_list=['name','region'],
+                          rowpctn=False, beautify=True, p_values=False, df_ord=df_order)
+        
+    Author: Charles Coombs - 2021/04/14
+
+    Updates:
+
+    """
+    
+    from operator import add
+    from functools import reduce
+    
+    import pandas as pd
+    import numpy as np
+    
+    from natsort import natsorted
+    from natsort import natsort_keygen
+    
+    from scipy import stats
+    
+        
+    def analysis_categorical(col_i, df, col_to_strat, distinct_values, ord, df_ord):
+        """
+        Calculate count by categorical col_i by col_to_strat.
+        """
+        #################
+        # count records by the col_i (regardless to the pivoted column)
+        #################
+        df_cat_stat = df[col_i].value_counts(dropna=False)\
+                        .reset_index()\
+                        .rename(columns={col_i: "Total", "index":"Values"})
+                        
+        # Convert Values column to string in case col_i was date or other type.   
+        df_cat_stat['Values'] = df_cat_stat['Values'].astype(str)
+        
+        if col_to_strat:
+            ##############
+            # If there is a stratification variable
+            ##############
+            # loop through all distinct values of col_to_strat and any categories
+            # Do it this way because category dtypes are annoying with fillna.
+                
+            for val in distinct_values:
+                if (str(val) != 'nan') & (val != None) & (pd.isnull(val) is False):
+                    _temp = df[df[col_to_strat] == val][col_i].value_counts(dropna=False)\
+                                .reset_index()\
+                                .rename(columns={col_i: val, "index":"Values"})
+                                
+                    # Convert Values column to string in case col_i was date or other type.   
+                    _temp['Values'] = _temp['Values'].astype(str)
+                    
+                else:
+                     _temp = df[df[col_to_strat].isna()][col_i].value_counts(dropna=False)\
+                                .reset_index()\
+                                .rename(columns={col_i: '_Missing_', "index":"Values"})
+                                
+                     # Convert Values column to string in case col_i was date or other type.   
+                     _temp['Values'] = _temp['Values'].astype(str)
+                
+                df_cat_stat = pd.merge(left=df_cat_stat, right=_temp, on="Values", how="outer").sort_values(by = "Values", key = natsort_keygen())
+                
+                del _temp
+
+        df_cat_stat["Values"] = np.where( df_cat_stat["Values"].isnull() , "_Missing_", df_cat_stat["Values"] )
+         
+        df_cat_stat["Variable type"] = "categorical"
+        df_cat_stat["Characteristics"] = col_i
+        
+        #######################
+        # Modify order
+        #######################
+        
+
+        ###################
+        # Add order based on alphabetic order of col_i
+        ##################
+        # EXCEPT "Yes" goes before "No"
+        # "Missing" or "Unknown" or "Other" goes last but before null filled "_Missing_".
+        # If the variable is category dtype, then that will provide an order after 'Yes', 'No' 
+        df_cat_stat["Order"] = (np.where(df_cat_stat["Values"] == "Yes", ord,
+                                np.where(df_cat_stat["Values"] == "No", 0.001+ord,np.nan)
+                                ))
+        
+        df_cat_stat = df_cat_stat.sort_values(by = ["Order","Values"], key = natsort_keygen()).reset_index().drop(columns=["index"])
+        
+        df_cat_stat["Order"] = (np.where(df_cat_stat["Order"].notnull(), df_cat_stat["Order"],
+                            df_cat_stat.index.values/1000 + ord))
+            
+        if df_ord is not None:
+            ######################
+            # Reorder based on order supplied by df_ord
+            ######################
+            # If "Order new" is null, the order probably wasnt supplied OR the value is probably _Missing_ so make it the last row
+            df_cat_stat = pd.merge(left=df_cat_stat, right=df_ord[df_ord["Characteristics"]==col_i], 
+                                   on=["Characteristics","Values"],  how="outer")
+            
+            # df_cat_stat["Order"] = np.where( df_cat_stat["Order new"].notnull(), ord + df_cat_stat["Order new"]/1000,
+                                   # np.where( df_cat_stat['Values'] != '_Missing_', df_cat_stat['Order'],
+                                        # ord + (df_cat_stat["Order new"].max() +1)/1000))
+                                        
+            df_cat_stat["Order"] = np.where( df_cat_stat["Order new"].notnull(), ord + df_cat_stat["Order new"]/1000,
+                                                df_cat_stat['Order'])
+            
+            df_cat_stat = df_cat_stat.drop(columns=["Order new"])
+            
+        #################
+        # Add blank row for formatting
+        #################
+        df_cat_stat = df_cat_stat.append(pd.Series(dtype='object'), ignore_index=True)
+        df_cat_stat["Order"] = df_cat_stat["Order"].fillna(ord+1)
+    
+        df_cat_stat = df_cat_stat.sort_values(by = ["Order","Values"], key = natsort_keygen()).reset_index().drop(columns=["index"])
+    
+        return df_cat_stat
+
+    
+    def analysis_continuous(col_i, df, col_to_strat, distinct_values, ord):
+        """
+        Calculate for continous col_i by col_to_strat:
+        [n, mean, std, min, max, q25, q50, q75].
+    
+        Create ord here so that can create proper order for each stat.
+        """
+        ##############
+        # count records by the col_i (regardless to the pivoted column)
+        ##############
+        df_cont_stat = df[col_i].describe()\
+                                .reset_index()\
+                                .rename(columns={"index":"Values", col_i:"Total"})
+                                
+        # Add standard error of the mean
+        # df_cont_stat = df_cont_stat.append(pd.DataFrame(data={"Values":"sem","Total":stats.sem(df[col_i], nan_policy='omit')}, index=[0])).reset_index(drop=True)
+                                
+        if col_to_strat:
+            ###############
+            # If there is a stratification variable
+            ##############
+            # loop through all distinct values of col_to_strat and any categories
+            # Do it this way because category dtypes are annoying with fillna.
+            
+            for val in distinct_values:
+                if (str(val) != 'nan') & (val != None) & (pd.isnull(val) is False):
+          
+                    _temp = df[df[col_to_strat] == val][col_i].describe()\
+                                .reset_index()\
+                                .rename(columns={col_i: val, "index":"Values"})
+                                
+                    # Add standard error of the mean
+                    # _temp = _temp.append(pd.DataFrame(data={"Values":"sem",val:stats.sem(df[df[col_to_strat] == val][col_i], nan_policy='omit')}, index=[0])).reset_index(drop=True) 
+                
+                else:
+                     _temp = df[df[col_to_strat].isna()][col_i].describe()\
+                                .reset_index()\
+                                .rename(columns={col_i: '_Missing_', "index":"Values"})
+                        
+                    # Add standard error of the mean                        
+                     # _temp = _temp.append(pd.DataFrame(data={"Values":"sem",'_Missing_':stats.sem(df[df[col_to_strat].isna()][col_i], nan_policy='omit')}, index=[0])).reset_index(drop=True)
+                                                                                               
+                df_cont_stat = pd.merge(left=df_cont_stat, right=_temp, on="Values", how="outer")
+            
+                del _temp
+            
+        df_cont_stat["Variable type"] = "continuous"
+        df_cont_stat["Characteristics"] = col_i
+        
+        df_cont_stat["Order"] = df_cont_stat.index.values/1000 + ord
+        
+        df_cont_stat.loc[df_cont_stat["Values"] == "count", "Values"] = "n"
+        
+        ###############
+        # Add blank row for formatting
+        ###############
+        df_cont_stat = df_cont_stat.append(pd.Series(dtype='object'), ignore_index=True)
+        df_cont_stat["Order"] = df_cont_stat["Order"].fillna(ord+1)
+    
+        return df_cont_stat
+    
+    
+    
+    def p_values_continuous(col_i, df, col_to_strat,unique_list, unique_ct,ord):
+        """
+            Find the p value for the continuous variable.
+            If the stratified column has 2 distinct values than use t-test,
+            >=2 use ANOVA, otherwise print message and return nothing.
+        """
+    
+        if unique_ct == 2:
+            # Perform t test
+            a = df.loc[df[col_to_strat] == unique_list[0]][col_i]
+            b = df.loc[df[col_to_strat] == unique_list[1]][col_i]
+            t, p_value = stats.ttest_ind(a, b, nan_policy='omit')
+    
+            df_p = pd.DataFrame({"test_name": "t-test", "p_value": p_value, "test_value": t}, index=[0])
+    
+        elif unique_ct > 2:
+            # Perform ANOVA
+            sample_list = [(df.loc[(df[col_to_strat] == value) & (df[col_i].notnull())][col_i]) for value in unique_list]
+    
+            F_value, p_value = stats.f_oneway(*sample_list)
+    
+            df_p = pd.DataFrame({"test_name": "ANOVA", "p_value": p_value, "test_value": F_value}, index=[0])
+    
+        else:
+            print("Notice: <2 distinct values for {}. p value not returned".format(col_to_strat))
+            df_p = pd.DataFrame({"test_name": "NOT DONE", "p_value": np.nan, "test_value": np.nan}, index=[0])
+    
+        # Add 2 columns for a cleaner join.
+        # Convert to float else its an integer and will throw a warning during the join later
+        df_p["Order"] = ord
+        df_p["Order"] = df_p["Order"].astype(float)
+        df_p["Characteristics"] = col_i
+        
+        return df_p
+    
+    
+    def p_values_categorical(col_i, df, col_to_strat, ord):
+        """
+            Find the p value for the categorical variable.
+            If the variable has more than 5 values, do chi-square, else do nothing.
+        """
+    
+        # If count of col_i is <5 than don't run test
+        col_i_ct = len(df[col_i].dropna())
+    
+        if col_i_ct >= 5:
+            # Make the cross tab
+            crtb = pd.crosstab(df[col_i], df[col_to_strat])
+    
+            # Do the chi-square on the cross tab
+            chi2, p_value, dof, expected = stats.chi2_contingency(crtb)
+    
+            df_p = pd.DataFrame({"test_name": "Chi-Square", "p_value": p_value, "test_value": chi2}, index=[0])
+    
+        else:
+            print("Notice: <5 values for {}. p value not returned".format(col_i))
+            df_p = pd.DataFrame({"test_name": "NOT DONE", "p_value": np.nan, "test_value": np.nan}, index=[0])
+    
+        # Add 2 columns for a cleaner join.
+        # Convert to float else its an integer and will throw a warning during the join later
+        df_p["Order"] = ord
+        df_p["Order"] = df_p["Order"].astype(float)
+        df_p["Characteristics"] = col_i
+    
+        return df_p
+    
+    ##################################################################################
+    # Override p_value indicator if no stratification variable so doesnt mess up run.
+    ##################################################################################
+    
+    if col_to_strat == "" and p_values is True:
+        p_values = False
+        print("p_values indicator overridden to False because no stratification variable")
+    
+    #######################################################################
+    # Calculate general statistics (regardless to cols_to_analyze_list)
+    #######################################################################
+    
+    # Start output row order counter and column order lists
+    ord = 0
+    
+    output_column_names = ["Total"]
+    
+    column_order = ["Order", "Characteristics", "Variable type", "Values"]
+    
+    if col_to_strat == "":
+        ################
+        # If there is NOT a stratification variable
+        #################
+    
+        # Find row count
+        count_all = len(df.index)
+    
+        df_all = pd.DataFrame({"Characteristics": "Total", "Values": "ALL",
+                                                     "Variable type": np.nan,
+                                                     "Total": count_all, "Total_%": 1,
+                                                     "Order": ord}, index=[0])
+    
+        column_order += ["Total", "Total_%"]
+    
+    else:
+        ######################
+        # If there is a stratification variable
+        ######################
+        # value counts captures all category values if category dtype and nulls
+        df_all = df[col_to_strat].value_counts(dropna = False).to_frame()\
+                    .reset_index()
+        
+        # Convert to float so can round later
+        df_all[col_to_strat] = df_all[col_to_strat].astype("float")
+        
+        df_all["index"] = np.where( df_all["index"].isnull() , "_Missing_", df_all["index"] )
+        df_all['dummy'] = 1
+        
+        df_all = df_all.pivot(index='dummy', columns='index', values=col_to_strat).reset_index(drop=True)
+        
+        ################
+        # Reorder column names from pivot count to put "Yes" before "No" and "_Missing_" at the end.
+        ################
+        pivot_ct_col_orig = list(df_all)
+        
+        # Natural sort column names
+        pivot_ct_col_orig = natsorted(pivot_ct_col_orig)
+    
+        pivot_ct_col_sorted = []
+    
+        for c in pivot_ct_col_orig:
+            if c in ["No", "Yes"]:
+                # Since it is sorted, "No" will appear before "Yes".
+                pivot_ct_col_sorted = [c] + pivot_ct_col_sorted
+            elif c != "_Missing_":
+                pivot_ct_col_sorted.append(c)
+    
+        if "_Missing_" in pivot_ct_col_orig:
+            pivot_ct_col_sorted.append("_Missing_")
+    
+        #################
+        # Prepare column names with "_%"
+        #################
+        output_column_names.extend(pivot_ct_col_sorted)
+    
+        output_columns_with_percent_names = []
+    
+        for c in output_column_names:
+            output_columns_with_percent_names += [c, c + "_%"]
+    
+        column_order.extend(output_columns_with_percent_names)
+    
+        ##############
+        # Create dataframe of individual category counts, total count, and percents.
+        ##############
+        # "add" function here was imported from operations so
+        df_all["Characteristics"] =  "Total"
+        df_all["Total"] = reduce(add, [df_all[x] for x in output_column_names if x != "Total"])
+        df_all["Values"] = "All"
+        df_all["Variable type"] = np.nan
+        df_all["Order"] = ord
+        
+        # Add 1 as 100% for each category percent unless row percent
+        if rowpctn == False:
+            for c in output_column_names:
+                df_all[c + "_%"] = 1
+        elif rowpctn == True:
+            for c in output_column_names:
+                df_all[c + "_%"] = df_all[c]/df_all["Total"]
+    
+        # Change column order and add columns if finding p values
+        if p_values is True:
+            column_order += ["p_value", "test_value", "test_name"]
+            
+            df_all["p_value"] = np.nan
+            df_all["test_name"] = np.nan
+            df_all["test_value"] = np.nan
+    
+    ##############
+    # Add blank row for formatting
+    ##############
+    ord += 1
+    
+    df_all = df_all.append(pd.Series(dtype='object'), ignore_index=True)
+    df_all["Order"] =  df_all["Order"].fillna(ord)
+    
+    #############
+    # Add to summary list
+    #############
+    dfs_to_union = [df_all[column_order]]
+    
+    #######
+    # Iterate index +1
+    #######
+    ord += 1
+    
+    #######################################################################
+    # Calculate statistics for cols_to_analyze_list
+    #######################################################################
+    
+    ############
+    # Find the count for "Total" and in each strat value (used to derive percents later)
+    ############
+    counts_dict = df_all.to_dict(orient='list')
+    
+    # Find distinct values for col_to_strat if exists
+    if col_to_strat == "":
+        distinct_values = []
+    else:
+        if str(df[[col_to_strat]].dtypes[0]) == 'category':
+            distinct_values = list(set(list(df[col_to_strat].unique()) + list(df[col_to_strat].cat.categories) ))
+        else:
+            distinct_values = list(set(list(df[col_to_strat].unique())))
+            
+        # For p_values, cant use distinct_values because that includes values that dont exist
+        unique_list = df[df[col_to_strat].notnull()][col_to_strat].unique().tolist()
+        unique_ct = len(unique_list)
+    
+    #col_i = "name"
+    for col_i in cols_to_analyze_list:
+        
+        if col_i in cols_freq_list:
+            #################
+            # conduct categorical analysis
+            #################
+            
+            # Complete the analysis.
+            df_stat = analysis_categorical(col_i, df, col_to_strat, distinct_values, ord,df_ord)
+            
+            # Find percent for each cols_to_analyze_list or for each row
+            if rowpctn == False:
+                for cat_col in output_column_names:
+                    df_stat[cat_col + "_%"] = df_stat[cat_col]/counts_dict[cat_col][0]
+            elif rowpctn == True:
+                for cat_col in output_column_names:
+                    df_stat[cat_col + "_%"] = df_stat[cat_col]/df_stat["Total"]
+            
+            # calculate the p value
+            if p_values is True:
+                df_p_values = p_values_categorical(col_i, df, col_to_strat, ord)
+            
+                df_stat = pd.merge(left=df_stat, right=df_p_values, on=["Order", "Characteristics"], how="left")
+        
+        else:
+            ##############
+            # conduct continuous analysis
+            ##############
+            # Categorical needs nulls for col_i to be "_Missing_"
+            # but continuous needs nulls to remain null.
+            
+            # Run the analysis
+            df_stat = analysis_continuous(col_i, df, col_to_strat, distinct_values, ord)
+          
+            # Add Null so can be stacked with the categorical analysis
+            for cat_col in output_column_names:
+                df_stat[cat_col +"_%"] = np.nan  
+          
+            # calculate the p value
+            if p_values is True:
+                df_p_values = p_values_continuous(col_i, df, col_to_strat, unique_list, unique_ct, ord)
+            
+                df_stat = pd.merge(left=df_stat, right=df_p_values, on=["Order", "Characteristics"], how="left")
+            
+        #########
+        # Add to summary list  
+        #########
+        dfs_to_union.append(df_stat[column_order])
+        
+        ############
+        # Clean-up some dataframes
+        ############
+        del df_stat
+    
+        #################
+        # Counter +2 because there is a blank row after each stat df that is ord+1
+        #################
+        ord += 2
+        
+    ##########
+    # Create one dataframe from list of dataframes
+    ##########
+    final_df = pd.concat(dfs_to_union)
+    
+    ##########################################
+    # Beautify
+    #########################################
+    # Make the table presentation ready by:
+    # - Combine columns to n(%) and round to 3 decimal places
+    # - Remove redundant values in "Characteristics".
+    # - Remove "Order" and "Variable type" columns
+
+    if beautify is True:
+        
+        # Combine n and percent to n(%) in one column.
+        # Round all decimal stats to 3 decimal places.
+        # Skip the first 4 columns: Order, Characterists, Variable Type, Values and any p_value columns
+        # Iterate by 2 to select the column without the "_%" in the name.
+        # col + "_%" will be null for continous variables.
+        # If cast 'nan' to str it will make a string called 'nan', so need to make it np.nan (null)
+        for col in [x for x in column_order[4::2] if x not in ["p_value", "test_value","test_name"]]:
+            final_df[col] = (
+            
+                # Categorical Variables: No decimal places for counts and 1 decimal place for %
+                np.where(final_df[col + "_%"].notnull(), 
+                         final_df[col].apply(lambda x : "{:,.0f}".format(x)).astype(str) + " (" + (final_df[col+"_%"]*100).round(1).apply(lambda x : "{:,.1f}".format(x)).astype(str) + "%)",
+                         # (final_df[col+"_%"]*100).round(1).astype(str)
+               
+               # Continuous Variables: No decimal place for 'n'; 1 for means, medians, min, and max; and 2 for std
+               np.where( (final_df[col].notnull()) & (final_df["Values"] == 'n') ,
+                        final_df[col].apply(lambda x : "{:,.0f}".format(x)).astype(str),
+                        
+               np.where( (final_df[col].notnull()) & (final_df["Values"].isin(["mean","min","25%","50%","75%","max"])),
+                        final_df[col].round(1).apply(lambda x : "{:,.1f}".format(x)).astype(str),
+                        
+               np.where( (final_df[col].notnull()) & (final_df["Values"].isin(["std","sem"])),
+                        final_df[col].round(2).apply(lambda x : "{:,.2f}".format(x)).astype(str),
+                        
+                        # (final_df.isin({"Values":["mean","min","25%","50%","75%","max"]}))
+                        # final_df[col].round(3).apply(lambda x : "{:,}".format(x)).astype(str)
+                        
+               # Categorical Variables: "0, (0%)" if null
+               np.where((final_df["Characteristics"].notnull()) & (final_df["Variable type"] != "continuous") , "0 (0%)",
+                        None)))))
+            )
+            
+            final_df.drop(col+"_%", axis=1, inplace=True)
+        
+        # Round and clean-up p-value column names
+        if p_values is True:
+            
+            final_df["p_value"] =  np.where(final_df["p_value"].notnull(),
+                                            final_df["p_value"].round(3).apply(lambda x : "{:,.3f}".format(x)).astype(str),
+                                            final_df["p_value"])
+            
+            final_df["test_value"] =  np.where(final_df["test_value"].notnull(),
+                                               final_df["test_value"].round(3).apply(lambda x : "{:,.3f}".format(x)).astype(str),
+                                               final_df["test_value"])
+            
+            final_df = final_df.rename(columns={"p_value":"p Value","test_value":"Test Value","test_name":"Test Name"})
+        
+        # Blank out headings on non heading rows of "Characteristics"
+        final_df["Characteristics"] = np.where( final_df.index == 0 ,final_df["Characteristics"].str.title(), np.nan)  
+        
+        # Drop columns
+        final_df = final_df.drop(columns=(["Variable type", "Order"]))
+    
+    return final_df
