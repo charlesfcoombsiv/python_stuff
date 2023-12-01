@@ -1,0 +1,427 @@
+def tableone_snflk(indata, prj_db_schema, outdata , cur, return_df = None, drop_snflk = None, col_to_strat="", cols_to_analyze_list=[], cols_freq_list=[]):
+    """
+    roll_up_spans_snflk
+    Roll-up treatment spans with an allowable gap in between spans.
+    
+    Parameters:
+            indata                  : (string) Full location of table to analyze '<Database>.<Schema>.<Table name>'
+                                            Can be a select statement in parenthesis e.g. (SELECT * FROM pop_pre WHERE index_date IS NOT NULL)
+
+            prj_db_schema           : (string) Database and schema of the project. Used to save intermediary tables to.
+                                                     '<Database>.<Schema>'
+            
+            outdata                 : (string) full location of output table '<Database>.<Schema>.<Table name>'
+            
+            cur                     : (object) Cursor with the Snowflake connection to the warehouse but not a specific database or schema.
+            
+            return_df               : (Boolean: True, False) Return a Pandas dataframe of the result table.
+                                                If set to True, drop_snflk will be set to True unless specified otherwise.
+
+            drop_snflk              : (Boolean: True, False) True to delete the outdata table on Snowflake. 
+                                                Leave blank if want to keep, unless return_df is True.
+            
+            col_to_strat            : (string) (optional) Categorical variables (columns) to stratify analysis by.
+            
+            cols_to_analyze_list    : (list of strings) list of columns to analyze
+                                       
+            cols_freq_list          : (list of strings) list of columns to treat as categorical variables.
+                                       
+
+    
+    Returns:
+            Create &outdata. table with all the spans collapsed by an allowable gap.
+    
+    Example:
+    
+       df_tb1 = tableone_snflk(indata=prj_db_schema + ".pbc_dx_ip_op", 
+                               prj_db_schema = prj_db_schema, 
+                               outdata="{}.tb1".format(prj_db_schema),
+                               cur=cur,
+                               return_df = True,
+                               drop_snflk = False,
+                               col_to_strat = "pbc_dx",
+                               cols_to_analyze_list = ['pbc_dx_soc'],
+                               cols_freq_list = ['pbc_dx_soc'])
+            
+    Author: Charles Coombs - 2022/01/31
+
+    Updates:
+    
+    """
+    import re
+    import pandas as pd
+    
+    # indata = prj_db_schema + ".pbc_dx_ip_op"
+    # outdata = prj_db_schema + ".tableone_test"
+    # col_to_strat = "pbc_dx"
+    # cols_to_analyze_list = ['pbc_dx_soc']
+    # cols_freq_list = ['pbc_dx_soc']
+    # return_df = None
+    # drop_snflk = None
+    
+    ############################################
+    # Capitalize Snowflake identifiers
+    ############################################
+    indata = indata.upper()
+    
+    outdata = outdata.upper()
+    db_outdata = outdata.split(".")[0]
+    schema_outdata = outdata.split(".")[1]
+    tb_outdata = outdata.split(".")[2]
+    
+    col_to_strat = col_to_strat.upper()
+    
+    ############################################
+    # Find total count
+    ############################################
+    # Find total count as variable so be used as denominator later.
+    # Can add row count percent easier if setup this way.
+
+    total_ct = cur.execute("SELECT count(*) AS total_ct FROM {}".format(indata)).fetchall()[0][0]
+                                                                        
+    cur.execute(""" CREATE OR REPLACE TABLE {outdata} AS
+                    SELECT CAST(0 AS float) AS ord, CAST('Total' AS STRING) AS characteristics, 
+                        CAST('All' AS STRING) AS value, TO_VARCHAR({total_ct},'999,999,999,999,999') || ' (' || ROUND({total_ct} / {total_ct} * 100, 2) || '%)' AS total
+                    FROM {indata}
+                    LIMIT 1
+                """.format(outdata = outdata, total_ct=total_ct, indata=indata))
+
+
+    ############################################
+    # Find total count by col_to_strat
+    ############################################
+    if col_to_strat:
+
+        #######
+        # Make list of col_to_start values to loop through.
+        #######
+        col_to_strat_values = list(cur.execute("""SELECT distinct IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') AS {col_to_strat} FROM {indata}"""
+                                              .format(col_to_strat=col_to_strat, indata=indata)).fetch_pandas_all()[col_to_strat])
+        
+        # Remove characters that would interfere with value becoming a column name for Snowflake.
+        # If begins with number, then add a "_".
+        col_to_strat_values_clean = [re.sub("[\/()@+=\-']","",x) for x in col_to_strat_values]
+        col_to_strat_values_clean = [x.replace(" ", "_") for x in col_to_strat_values_clean]
+        
+        col_to_strat_values_clean = ["_" + x if x[0].isnumeric() else x for x in col_to_strat_values_clean]
+        
+        #######
+        # Make list of the total counts per strat value
+        #######
+
+        strat_total_ct_list = []
+        
+        for i, value in enumerate(col_to_strat_values):
+            value_clean = col_to_strat_values_clean[i]
+
+            _strat_total_ct = cur.execute("""SELECT count(*) FROM {indata} WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') = '{value}'"""
+                        .format(indata=indata, col_to_strat=col_to_strat, value=value)).fetchall()[0][0]
+
+            #######
+            # Add total counts per strat value as different columns in outdata.
+            #######
+            cur.execute(""" CREATE OR REPLACE TABLE {outdata} AS
+                        SELECT a.*, b.{value_clean}
+                        FROM {outdata} AS a
+                        LEFT JOIN
+                            (SELECT CAST(0 AS float) AS ord,
+                                TO_VARCHAR({_strat_total_ct},'999,999,999,999,999') || ' (' || ROUND({_strat_total_ct} / {_strat_total_ct} * 100, 2) || '%)' 
+                                    AS {value_clean}
+                             FROM {indata}
+                             LIMIT 1) AS b
+                        ON a.ord = b.ord
+                        """.format(outdata=outdata,value_clean=value_clean,_strat_total_ct=_strat_total_ct, indata=indata))
+
+            # Append list of col_to_start counts for denominators later.
+            strat_total_ct_list.append(_strat_total_ct)
+
+
+    ############################################
+    # Analyze Variables in cols_to_analyze_list
+    ############################################
+
+    for i, var in enumerate(cols_to_analyze_list):
+
+        ############################################
+        # Find freqs for categorical variables
+        ############################################
+        if var in cols_freq_list:
+
+            #######
+            # Find freq regardless of col_to_strat.
+            #######
+   
+            cur.execute("""CREATE OR REPLACE TABLE {prj_db_schema}._temp_outdata867 AS
+    
+                            SELECT {i} + 0.1 AS ord, NULL AS characteristics, NULL AS value, 
+                                 NULL AS total
+                            FROM {indata}
+    
+                            UNION
+    
+                            SELECT {i} + 0.2 AS ord, '{var}' AS characteristics,  IFNULL( CAST({var} AS STRING), '_MISSING_') AS value, 
+                                 TO_VARCHAR(COUNT(*),'999,999,999,999,999' ) || ' (' || ROUND(COUNT(*) / {total_ct} * 100, 2) || '%)' AS total
+                            FROM {indata}
+                            GROUP BY 1,2,3
+                        """.format(prj_db_schema=prj_db_schema, i=i, indata=indata, var=var, total_ct=total_ct ))
+
+            #######
+            # Find freqs based on col_to_strat
+            #######
+
+            if col_to_strat:
+                for j, value in enumerate(col_to_strat_values):
+                    
+                    value_clean = col_to_strat_values_clean[j]
+                    value_ct = strat_total_ct_list[j]
+
+                    #######
+                    # Add total counts per strat value as different columns in temp outdata.
+                    #######
+
+
+                    cur.execute(""" CREATE OR REPLACE TABLE {prj_db_schema}._temp_outdata867 AS
+                                    SELECT a.*, b.{value_clean}
+                                    FROM {prj_db_schema}._temp_outdata867 AS a
+                                    LEFT JOIN
+                                        (SELECT {i} + 0.2 AS ord, '{var}' AS characteristics, IFNULL( CAST({var} AS STRING), '_MISSING_') AS value, 
+                                            TO_VARCHAR(count_if( IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') = '{value}'), '999,999,999,999,999')
+                                                    || ' (' 
+                                                    || ROUND(count_if(IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') = '{value}') / {value_ct} * 100, 2) 
+                                                    || '%)' 
+                                                AS {value_clean}
+                                         FROM {indata}
+                                         GROUP BY 1,2,3) AS b
+                                    ON a.ord = b.ord AND a.characteristics = b.characteristics AND a.value=b.value
+                                """.format(prj_db_schema=prj_db_schema, value_clean=value_clean, i=i, indata=indata, var=var, value=value, value_ct=value_ct,
+                                            col_to_strat=col_to_strat))
+
+        else:
+        ################################################################
+        # Find descriptions for continous variables (n,mean,max,etc.)
+        ################################################################
+            
+            ####### 
+            # Find descriptions regardless of col_to_strat.
+            #######
+    
+            cur.execute(""" CREATE OR REPLACE TABLE {prj_db_schema}._temp_outdata867 AS
+
+                            SELECT {i} + 0.1 AS ord, NULL AS characteristics, NULL AS value, 
+                                 NULL AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.2 AS ord,'{var}' AS characteristics, 'n' AS value, 
+                                 TO_VARCHAR(count({var}),'999,999,999,999,999') AS total
+                            FROM {indata}
+                            
+                            UNION
+        
+                            SELECT {i} + 0.3 AS ord,'{var}' AS characteristics, 'mean' AS value, 
+                                 TO_VARCHAR(ROUND(avg({var}),2), '999,999,999,999,999.99') AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.4 AS ord,'{var}' AS characteristics, 'std' AS value, 
+                                 TO_VARCHAR(ROUND(stddev({var}),2),'999,999,999,999,999.99') AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.5 AS ord,'{var}' AS characteristics, 'min' AS value, 
+                                 TO_VARCHAR(ROUND(min({var}),2), '999,999,999,999,999.99') AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.6 AS ord,'{var}' AS characteristics, '25%' AS value, 
+                                 TO_VARCHAR(ROUND(approx_percentile({var}, 0.25),2), '999,999,999,999,999.99') AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.7 AS ord,'{var}' AS characteristics, '50%' AS value, 
+                                 TO_VARCHAR(ROUND(median({var}),2), '999,999,999,999,999.99') AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.8 AS ord,'{var}' AS characteristics, '75%' AS value, 
+                                 TO_VARCHAR(ROUND(approx_percentile({var}, 0.75),2), '999,999,999,999,999.99') AS total
+                            FROM {indata}
+        
+                            UNION
+        
+                            SELECT {i} + 0.9 AS ord,'{var}' AS characteristics, 'max' AS value, 
+                                 TO_VARCHAR(ROUND(max({var}),2),'999,999,999,999,999.99') AS total
+                            FROM {indata}
+                        """.format(prj_db_schema=prj_db_schema, i=i, var=var, indata=indata))
+
+
+            #######
+            # Find descriptions based on col_to_strat
+            #######
+
+            if col_to_strat:
+               for j, value in enumerate(col_to_strat_values): 
+                   
+                   value_clean = col_to_strat_values_clean[j]
+
+                    #######
+                    # Add descriptions per strat value as different columns in temp outdata.
+                    #######
+                    # Need to create a blank table to join the description metrics against so that if count is 0, there will be something to join
+                    # against in the loop.
+                   cur.execute(""" CREATE OR REPLACE TABLE {prj_db_schema}._temp_outdata867 AS
+
+                                SELECT c.*, d.{value_clean}
+                                FROM {prj_db_schema}._temp_outdata867 AS c
+                                LEFT JOIN (
+                    
+                                    SELECT a.ord, a.characteristics, a.value, coalesce(a.{value_clean}, b.{value_clean}) AS {value_clean}
+                                    FROM (
+    
+                                        SELECT {i} + 0.1 AS ord, NULL AS characteristics, NULL AS value, NULL AS {value_clean}
+                                        FROM {indata}
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.2 AS ord,'{var}' AS characteristics, 'n' AS value, 
+                                             TO_VARCHAR(count({var}), '999,999,999,999,999') AS {value_clean}
+                                        FROM {indata}
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                        UNION
+                                        SELECT {i} + 0.3 AS ord,'{var}' AS characteristics, 'mean' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                        UNION
+                                        SELECT {i} + 0.4 AS ord,'{var}' AS characteristics, 'std' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                        UNION
+                                        SELECT {i} + 0.5 AS ord,'{var}' AS characteristics, 'min' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                        UNION
+                                        SELECT {i} + 0.6 AS ord,'{var}' AS characteristics, '25%' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                        UNION
+                                        SELECT {i} + 0.7 AS ord,'{var}' AS characteristics, '50%' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                        UNION
+                                        SELECT {i} + 0.8 AS ord,'{var}' AS characteristics, '75%' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                        UNION
+                                        SELECT {i} + 0.9 AS ord,'{var}' AS characteristics, 'max' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+                                    ) AS a
+    
+                                    LEFT JOIN (
+                                        SELECT {i} + 0.1 AS ord, NULL AS characteristics, NULL AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.2 AS ord,'{var}' AS characteristics, 'n' AS value, NULL AS {value_clean}
+                                        FROM {indata} 
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.3 AS ord,'{var}' AS characteristics, 'mean' AS value, 
+                                            TO_VARCHAR(ROUND(avg({var}),2), '999,999,999,999,999.99') AS {value_clean}
+                                        FROM {indata}
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.4 AS ord,'{var}' AS characteristics, 'std' AS value,
+                                            TO_VARCHAR(ROUND(stddev({var}),2), '999,999,999,999,999.99') AS {value_clean}
+                                        FROM {indata} 
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.5 AS ord,'{var}' AS characteristics, 'min' AS value, 
+                                            TO_VARCHAR(ROUND(min({var}),2),'999,999,999,999,999.99') AS {value_clean}
+                                        FROM {indata} 
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.6 AS ord,'{var}' AS characteristics, '25%' AS value, 
+                                            TO_VARCHAR(ROUND(approx_percentile({var}, 0.25),2),'999,999,999,999,999.99') AS {value_clean}
+                                        FROM {indata} 
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.7 AS ord,'{var}' AS characteristics, '50%' AS value, 
+                                            TO_VARCHAR(ROUND(median({var}),2), '999,999,999,999,999.99')  AS {value_clean}
+                                        FROM {indata} 
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+                            
+                                        UNION
+    
+                                        SELECT {i} + 0.8 AS ord,'{var}' AS characteristics, '75%' AS value,  
+                                            TO_VARCHAR(ROUND(approx_percentile({var}, 0.75),2),'999,999,999,999,999.99')  AS {value_clean}
+                                        FROM {indata} 
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                        UNION
+    
+                                        SELECT {i} + 0.9 AS ord,'{var}' AS characteristics, 'max' AS value, 
+                                            TO_VARCHAR(ROUND(max({var}),2), '999,999,999,999,999.99') AS {value_clean}
+                                        FROM {indata} 
+                                        WHERE IFNULL(CAST({col_to_strat} AS STRING), '_MISSING_') ='{value}'
+    
+                                    ) AS b
+    
+                                    ON a.ord=b.ord AND a.characteristics = b.characteristics AND a.value = b.value
+    
+                                ) AS d
+    
+                                ON c.ord=d.ord AND c.characteristics = d.characteristics AND c.value = d.value
+                            """.format(i=i, indata=indata, var=var, prj_db_schema=prj_db_schema, value=value, value_clean=value_clean, col_to_strat=col_to_strat))
+
+        #######
+        # Stack onto outdata
+        #######
+        cur.execute(""" INSERT INTO {outdata}
+
+                        SELECT *
+                        FROM {prj_db_schema}._temp_outdata867
+                    """.format(outdata=outdata, prj_db_schema=prj_db_schema))
+
+        cur.execute("DROP TABLE {prj_db_schema}._temp_outdata867".format(prj_db_schema=prj_db_schema))
+
+    ################################################################
+    # Unload Snownflake table into Pandas
+    ################################################################
+            
+    if return_df is not None:
+
+        #######
+        # Set drop_snflk to True if unloading to SAS and the flag is None.
+        #######
+        if drop_snflk is None:
+            drop_snflk = True
+            
+        df_return = cur.execute("SELECT * FROM {outdata}".format(outdata=outdata)).fetch_pandas_all()
+        
+        df_return = df_return.sort_values("ORD")
+        
+        # The number formatting to add commas creates leading blank spaces
+        for c in df_return:
+            if c != 'ORD':
+                df_return[c] = df_return[c].str.strip()
+                
+
+    ##################################################################################
+    # Drop Snowflake table. Done default if unloading to Pandas and didnt specify keep.
+    ##################################################################################
+    if drop_snflk is True:
+        cur.execute("DROP TABLE {outdata}".format(outdata=outdata))
+        
+        
+    return df_return
